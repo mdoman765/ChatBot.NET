@@ -19,6 +19,9 @@ builder.Services.AddScoped<IFeedbackRepository, FeedbackRepository>();
 builder.Services.AddScoped<IOrderService, OrderService>();
 builder.Services.AddScoped<IUserRepository, UserRepository>();
 builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<IWhatsAppSessionRepository, WhatsAppSessionRepository>();
+builder.Services.AddScoped<IWhatsAppSessionService, WhatsAppSessionService>();
+
 builder.Services.Configure<FormOptions>(o =>
 {
     o.MultipartBodyLengthLimit = 10 * 1024 * 1024;
