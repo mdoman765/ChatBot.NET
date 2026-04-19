@@ -248,6 +248,11 @@ namespace crud_app_backend.Services
                 Text("email", req.Email);
                 Text("description", req.Description);
 
+                // ticket_type: COMPLAIN | CONNECT_TO_AGENT
+                Text("ticket_type", req.ComplaintType == "agent_connect"
+                    ? "CONNECT_TO_AGENT"
+                    : "COMPLAIN");
+
                 // Voice files → voice_file[] (actual binary)
                 foreach (var (fileName, mimeType, data) in voiceFiles)
                 {
