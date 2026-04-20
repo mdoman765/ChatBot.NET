@@ -27,8 +27,10 @@ namespace crud_app_backend.Repositories
         }
 
         // ── UPSERT ───────────────────────────────────────────────────────
-        // Pure EF Core — no stored procedure needed.
-        // Uses an execution strategy so it works with SQL Server retry policy.
+        // PERF: `fromStep` is now supplied by the caller (it's the in-memory
+        // PreviousStep from BotSession, passed via UpsertSessionRequestDto).
+        // We no longer read `existing.CurrentStep` just to get the from-step
+        // for the history row — the caller already knows it.
 
         public async Task UpsertAsync(
             WhatsAppSession session,
@@ -44,10 +46,14 @@ namespace crud_app_backend.Repositories
 
                 try
                 {
-                    // ── 1. Fetch existing row (tracked) ──────────────────
+                    // ── 1. Fetch existing row (tracked) — needed to decide INSERT vs UPDATE
                     var existing = await _db.WhatsAppSessions
                         .FirstOrDefaultAsync(s => s.Phone == session.Phone, ct);
 
+                    // CHANGED: use the PreviousStep supplied by the caller instead of
+                    // reading existing.CurrentStep — both represent the same value but
+                    // PreviousStep comes from the authoritative in-memory bot state,
+                    // avoiding any reliance on the DB read for history accuracy.
                     string fromStep;
 
                     if (existing == null)
@@ -65,7 +71,10 @@ namespace crud_app_backend.Repositories
                     else
                     {
                         // ── UPDATE ────────────────────────────────────────
-                        fromStep = existing.CurrentStep;
+                        // CHANGED: fromStep = session.PreviousStep  (was: existing.CurrentStep)
+                        fromStep = string.IsNullOrWhiteSpace(session.PreviousStep)
+                            ? existing.CurrentStep   // safe fallback if caller omits it
+                            : session.PreviousStep;
 
                         existing.CurrentStep = session.CurrentStep;
                         existing.PreviousStep = session.PreviousStep;

@@ -4,16 +4,17 @@ namespace crud_app_backend.Bot.Services
 {
     /// <summary>
     /// Wraps the 360dialog v2 API.
-    ///   Send:  POST https://waba-v2.360dialog.io/messages
-    ///   Media: GET  https://waba-v2.360dialog.io/{mediaId}
-    ///   Auth:  D360-API-KEY header (registered as "Dialog" named client)
+    ///   Send text:  POST https://waba-v2.360dialog.io/messages  (type=text)
+    ///   Send image: POST https://waba-v2.360dialog.io/messages  (type=image, link=url)
+    ///   Media:      GET  https://waba-v2.360dialog.io/{mediaId}
+    ///   Auth:       D360-API-KEY header (registered as "Dialog" named client)
     /// </summary>
     public class DialogClient : IDialogClient
     {
         private const string BaseUrl = "https://waba-v2.360dialog.io";
 
-        private readonly IHttpClientFactory      _factory;
-        private readonly ILogger<DialogClient>   _logger;
+        private readonly IHttpClientFactory    _factory;
+        private readonly ILogger<DialogClient> _logger;
 
         public DialogClient(IHttpClientFactory factory, ILogger<DialogClient> logger)
         {
@@ -42,12 +43,59 @@ namespace crud_app_backend.Bot.Services
             if (!resp.IsSuccessStatusCode)
             {
                 var body = await resp.Content.ReadAsStringAsync(ct);
-                _logger.LogWarning("[Dialog] Send failed {Code} to {Phone}: {Body}",
+                _logger.LogWarning("[Dialog] SendText failed {Code} to {Phone}: {Body}",
                     (int)resp.StatusCode, phone, body.Length > 200 ? body[..200] : body);
             }
             else
             {
-                _logger.LogDebug("[Dialog] Message sent to {Phone}", phone);
+                _logger.LogDebug("[Dialog] Text sent to {Phone}", phone);
+            }
+        }
+
+        // ── Send image with caption ───────────────────────────────────────────
+        // imageUrl = public HTTPS URL of the image on your server.
+        // e.g. https://chatbot.prangroup.com/images/pran-rfl-logo.jpg
+        // 360dialog fetches the image from this URL and delivers it to WhatsApp.
+        // No upload to 360dialog needed — served directly from your wwwroot/images/.
+
+        public async Task SendImageAsync(string phone, string imageUrl, string caption,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(imageUrl))
+            {
+                _logger.LogWarning("[Dialog] SendImage — no imageUrl, falling back to text");
+                await SendTextAsync(phone, caption, ct);
+                return;
+            }
+
+            var client = _factory.CreateClient("Dialog");
+            var payload = new
+            {
+                messaging_product = "whatsapp",
+                to   = phone,
+                type = "image",
+                image = new
+                {
+                    link    = imageUrl, // 360dialog fetches image from this public URL
+                    caption = caption   // shown below the image in WhatsApp
+                }
+            };
+
+            var resp = await client.PostAsJsonAsync($"{BaseUrl}/messages", payload, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync(ct);
+                _logger.LogWarning("[Dialog] SendImage failed {Code} to {Phone}: {Body}",
+                    (int)resp.StatusCode, phone, body.Length > 200 ? body[..200] : body);
+
+                // Always fallback to text so user is never left with silence
+                _logger.LogInformation("[Dialog] Falling back to text for {Phone}", phone);
+                await SendTextAsync(phone, caption, ct);
+            }
+            else
+            {
+                _logger.LogDebug("[Dialog] Image sent to {Phone}", phone);
             }
         }
 

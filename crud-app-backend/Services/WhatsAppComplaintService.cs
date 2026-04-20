@@ -34,19 +34,54 @@ namespace crud_app_backend.Services
         public async Task<SubmitComplaintResponseDto> SubmitAsync(
             SubmitComplaintRequestDto req, CancellationToken ct)
         {
+            // BUG FIX: wrap entire method in try-catch.
+            // Without this, any unhandled exception (e.g. DB insert failure after
+            // CRM succeeds) propagates to BotService.ProcessAsync, gets caught by
+            // the outer try-catch, logged silently — user only ever sees the ACK
+            // message and never gets the success/failure reply.
+            try
+            {
+                return await SubmitInternalAsync(req, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Complaint] SubmitAsync unhandled exception — type={T} phone={P}",
+                    req.ComplaintType, req.WhatsappPhone);
+                return new SubmitComplaintResponseDto
+                {
+                    Success = false,
+                    ComplaintId = null,
+                    ErrorMessage = "An unexpected error occurred. Please try again.",
+                    Message = "Unhandled exception in SubmitAsync",
+                };
+            }
+        }
+
+        private async Task<SubmitComplaintResponseDto> SubmitInternalAsync(
+            SubmitComplaintRequestDto req, CancellationToken ct)
+        {
             _logger.LogInformation(
                 "[Complaint] Submit — type={T} staff={S} phone={P} voices={V} images={I}",
                 req.ComplaintType, req.StaffId, req.WhatsappPhone,
                 req.VoiceMessageIds.Count, req.ImageMessageIds.Count);
 
-            // ── STEP 1: Load voice files from disk ────────────────────────────
-            // Done before CRM call so files are ready to send.
+            // ── STEP 1: Load voice files ──────────────────────────────────────
+            // FIX: EF Core DbContext is NOT thread-safe. Task.WhenAll with multiple
+            // GetByMessageIdAsync calls on the same DbContext causes:
+            // "A second operation was started on this context before a previous one completed"
+            // This was throwing and hitting the outer catch → "unexpected error" for users.
+            // Solution: sequential foreach — await each DB call one at a time.
+            var validVoiceIds = req.VoiceMessageIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToList();
+
             var voiceFiles = new List<(string FileName, string MimeType, byte[] Data)>();
-            foreach (var msgId in req.VoiceMessageIds)
+            var voiceMsgMap = new Dictionary<string, WhatsAppMessage?>();
+            foreach (var id in validVoiceIds)
             {
-                if (string.IsNullOrWhiteSpace(msgId)) continue;
-                var waMsg = await _messageRepo.GetByMessageIdAsync(msgId, ct);
-                var file = ReadFileDirect(msgId, "audio", waMsg?.MimeType ?? "audio/ogg");
+                var waMsg = await _messageRepo.GetByMessageIdAsync(id, ct);
+                voiceMsgMap[id] = waMsg;
+                var file = ReadFileDirect(id, "audio", waMsg?.MimeType ?? "audio/ogg");
                 if (file is not null)
                 {
                     voiceFiles.Add(file.Value);
@@ -54,18 +89,22 @@ namespace crud_app_backend.Services
                         file.Value.FileName, file.Value.Data.Length);
                 }
                 else
-                {
-                    _logger.LogWarning("[Complaint] Voice file not found on disk: msgId={Id}", msgId);
-                }
+                    _logger.LogWarning("[Complaint] Voice file not found on disk: msgId={Id}", id);
             }
 
-            // ── STEP 2: Load image files from disk ────────────────────────────
+            // ── STEP 2: Load image files ──────────────────────────────────────
+            // Same fix: sequential foreach instead of Task.WhenAll.
+            var validImageIds = req.ImageMessageIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToList();
+
             var imageFiles = new List<(string FileName, string MimeType, byte[] Data)>();
-            foreach (var msgId in req.ImageMessageIds)
+            var imageMsgMap = new Dictionary<string, WhatsAppMessage?>();
+            foreach (var id in validImageIds)
             {
-                if (string.IsNullOrWhiteSpace(msgId)) continue;
-                var waMsg = await _messageRepo.GetByMessageIdAsync(msgId, ct);
-                var file = ReadFileDirect(msgId, "images", waMsg?.MimeType ?? "image/jpeg");
+                var waMsg = await _messageRepo.GetByMessageIdAsync(id, ct);
+                imageMsgMap[id] = waMsg;
+                var file = ReadFileDirect(id, "images", waMsg?.MimeType ?? "image/jpeg");
                 if (file is not null)
                 {
                     imageFiles.Add(file.Value);
@@ -73,19 +112,15 @@ namespace crud_app_backend.Services
                         file.Value.FileName, file.Value.Data.Length);
                 }
                 else
-                {
-                    _logger.LogWarning("[Complaint] Image file not found on disk: msgId={Id}", msgId);
-                }
+                    _logger.LogWarning("[Complaint] Image file not found on disk: msgId={Id}", id);
             }
 
             // ── STEP 3: Send to CRM FIRST ─────────────────────────────────────
             // Only save to DB if CRM succeeds.
-            // Uses independent 120s timeout so n8n request timeout won't cancel it.
             var (crmTicketId, crmError) = await SendToCrmAsync(req, voiceFiles, imageFiles);
 
             if (crmTicketId is null)
             {
-                // CRM failed — do NOT save to DB, return error to n8n
                 _logger.LogWarning("[Complaint] CRM failed — skipping DB save. Error: {E}", crmError);
                 return new SubmitComplaintResponseDto
                 {
@@ -111,7 +146,7 @@ namespace crud_app_backend.Services
                 Email = req.Email,
                 Description = req.Description,
                 ComplaintType = req.ComplaintType,
-                CrmTicketId = crmTicketId,          // already known — set at insert
+                CrmTicketId = crmTicketId,
                 Status = "open",
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow,
@@ -123,10 +158,11 @@ namespace crud_app_backend.Services
             await _complaintRepo.UpdateComplaintNumberAsync(complaint.Id, complaintNumber, ct);
 
             // ── STEP 5: Save media rows ───────────────────────────────────────
-            foreach (var msgId in req.VoiceMessageIds)
+            // FIX: sequential inserts — same DbContext thread-safety reason as above.
+            // voiceMsgMap and imageMsgMap were built in Steps 1 & 2 so no extra DB reads.
+            foreach (var msgId in validVoiceIds)
             {
-                if (string.IsNullOrWhiteSpace(msgId)) continue;
-                var waMsg = await _messageRepo.GetByMessageIdAsync(msgId, ct);
+                voiceMsgMap.TryGetValue(msgId, out var waMsg);
                 await _complaintRepo.InsertMediaAsync(new WhatsAppComplaintMedia
                 {
                     ComplaintId = complaint.Id,
@@ -137,10 +173,9 @@ namespace crud_app_backend.Services
                 }, ct);
             }
 
-            foreach (var msgId in req.ImageMessageIds)
+            foreach (var msgId in validImageIds)
             {
-                if (string.IsNullOrWhiteSpace(msgId)) continue;
-                var waMsg = await _messageRepo.GetByMessageIdAsync(msgId, ct);
+                imageMsgMap.TryGetValue(msgId, out var waMsg);
                 await _complaintRepo.InsertMediaAsync(new WhatsAppComplaintMedia
                 {
                     ComplaintId = complaint.Id,
@@ -169,7 +204,6 @@ namespace crud_app_backend.Services
 
         // ─────────────────────────────────────────────────────────────────────
         // Read file directly from wwwroot/wa-media/{subFolder}/{messageId}.ext
-        // WhatsAppMessageService saves files here — we know the exact path.
         // ─────────────────────────────────────────────────────────────────────
         private (string FileName, string MimeType, byte[] Data)?
             ReadFileDirect(string messageId, string subFolder, string mimeType)
@@ -178,8 +212,8 @@ namespace crud_app_backend.Services
             {
                 var ext = MimeToExt(mimeType);
                 var folder = Path.Combine(_env.WebRootPath, "wa-media", subFolder);
-
                 var exactPath = Path.Combine(folder, $"{messageId}{ext}");
+
                 if (File.Exists(exactPath))
                 {
                     var bytes = File.ReadAllBytes(exactPath);
@@ -210,8 +244,10 @@ namespace crud_app_backend.Services
         // ─────────────────────────────────────────────────────────────────────
         // POST multipart/form-data to CRM.
         // Returns (crmTicketId, null) on success.
-        // Returns (null, errorMessage) on failure — errorMessage shown to user.
-        // Independent 120s timeout — NOT the request ct.
+        // Returns (null, errorMessage) on failure.
+        // CHANGED: internal CTS reduced to 55s (just under the 60s HttpClient
+        // timeout set in Program.cs) so we always surface a clean user-facing
+        // message rather than an HttpClient OperationCanceledException.
         // ─────────────────────────────────────────────────────────────────────
         private async Task<(string? TicketId, string? Error)> SendToCrmAsync(
             SubmitComplaintRequestDto req,
@@ -225,35 +261,32 @@ namespace crud_app_backend.Services
                 return (null, "CRM is not configured. Please contact system admin.");
             }
 
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            // CHANGED: was 120s — now 55s, just under the 60s HttpClient timeout
+            // in Program.cs, so our catch block always fires before HttpClient cancels.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(55));
 
             try
             {
                 using var form = new MultipartFormDataContent();
 
-                // Always send all text fields — even empty string.
-                // PHP foreach() crashes if field is missing (null) but handles "" fine.
                 void Text(string key, string? val)
                     => form.Add(new StringContent(val ?? string.Empty), key);
 
                 Text("chat_phone", req.WhatsappPhone);
                 Text("staff_id", req.StaffId);
                 Text("name", req.Name);
-                Text("phone", req.OfficialPhone);   // CRM field = phone
+                Text("phone", req.OfficialPhone);
                 Text("designation", req.Designation);
-                Text("department", req.Dept);            // CRM field = department
+                Text("department", req.Dept);
                 Text("groupname", req.GroupName);
                 Text("company", req.Company);
                 Text("locationname", req.LocationName);
                 Text("email", req.Email);
                 Text("description", req.Description);
-
-                // ticket_type: COMPLAIN | CONNECT_TO_AGENT
                 Text("ticket_type", req.ComplaintType == "agent_connect"
                     ? "CONNECT_TO_AGENT"
                     : "COMPLAIN");
 
-                // Voice files → voice_file[] (actual binary)
                 foreach (var (fileName, mimeType, data) in voiceFiles)
                 {
                     var content = new ByteArrayContent(data);
@@ -261,7 +294,6 @@ namespace crud_app_backend.Services
                     form.Add(content, "voice_file[]", fileName);
                 }
 
-                // Image files → images[] (actual binary)
                 foreach (var (fileName, mimeType, data) in imageFiles)
                 {
                     var content = new ByteArrayContent(data);
@@ -279,33 +311,25 @@ namespace crud_app_backend.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    var httpError = $"Support system returned error {(int)response.StatusCode}. Please try again.";
                     _logger.LogWarning("[Complaint] CRM HTTP {Code}: {Body}",
                         (int)response.StatusCode, body);
-                    return (null, httpError);
+                    return (null, $"Support system returned error {(int)response.StatusCode}. Please try again.");
                 }
 
-                // Parse: { "status": "success", "data": { "id": 13 } }
                 using var doc = JsonDocument.Parse(body);
                 var root = doc.RootElement;
 
-                // Check status field
                 if (root.TryGetProperty("status", out var sv) &&
                     sv.GetString()?.ToLower() != "success")
                 {
-                    // Extract CRM's own message if available
-                    var crmMsg = root.TryGetProperty("message", out var mv)
-                        ? mv.GetString()
-                        : null;
+                    var crmMsg = root.TryGetProperty("message", out var mv) ? mv.GetString() : null;
                     var errMsg = string.IsNullOrWhiteSpace(crmMsg)
                         ? "Support system could not process the request. Please try again."
                         : crmMsg;
-                    _logger.LogWarning("[Complaint] CRM status={S} message={M}",
-                        sv.GetString(), crmMsg);
+                    _logger.LogWarning("[Complaint] CRM status={S} message={M}", sv.GetString(), crmMsg);
                     return (null, errMsg);
                 }
 
-                // Extract ticket ID from data.id
                 if (root.TryGetProperty("data", out var dataEl) &&
                     dataEl.TryGetProperty("id", out var idEl))
                 {
@@ -321,8 +345,9 @@ namespace crud_app_backend.Services
             }
             catch (OperationCanceledException)
             {
-                _logger.LogError("[Complaint] CRM call timed out after 120s");
-                return (null, "Support system is taking too long to respond. Please try again.");
+                // CHANGED: clear user-facing timeout message instead of silent hang
+                _logger.LogError("[Complaint] CRM call timed out after 55s");
+                return (null, "⏱ Support system is taking too long to respond. Please try again in a moment.");
             }
             catch (Exception ex)
             {

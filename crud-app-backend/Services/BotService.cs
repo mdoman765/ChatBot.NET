@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -15,6 +16,7 @@ namespace crud_app_backend.Bot.Services
     /// Complete WhatsApp chatbot — exact replica of n8n workflow.
     /// Every message string matches the n8n Code node character-for-character.
     /// Includes: Fix1 (IMemoryCache session), Fix4 (no ExistsAsync on media).
+    /// Perf: Instant ACK on external-HTTP paths, sliding session cache (60 min).
     /// </summary>
     public class BotService : IBotService
     {
@@ -25,9 +27,10 @@ namespace crud_app_backend.Bot.Services
         private readonly IConfiguration _config;
         private readonly IDialogClient _dialog;
         private readonly IHrisService _hris;
-        private readonly IHttpClientFactory _httpFactory;   // ← replaces new HttpClient()
+        private readonly IHttpClientFactory _httpFactory;
         private readonly IMemoryCache _cache;
         private readonly ILogger<BotService> _logger;
+        private readonly BotStateService _state; // singleton — shared across all requests
 
         public BotService(
             IWhatsAppSessionService sessionSvc,
@@ -39,7 +42,8 @@ namespace crud_app_backend.Bot.Services
             IHrisService hris,
             IHttpClientFactory httpFactory,
             IMemoryCache cache,
-            ILogger<BotService> logger)
+            ILogger<BotService> logger,
+            BotStateService state)
         {
             _sessionSvc = sessionSvc;
             _complaintSvc = complaintSvc;
@@ -51,6 +55,7 @@ namespace crud_app_backend.Bot.Services
             _httpFactory = httpFactory;
             _cache = cache;
             _logger = logger;
+            _state = state;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -69,22 +74,86 @@ namespace crud_app_backend.Bot.Services
                 _logger.LogInformation("[Bot] {Type} from {Phone} id={Id}",
                     msg.MsgType, msg.From, msg.MessageId);
 
-                // Fix 1: memory cache first, SQL fallback
-                var session = await LoadSessionAsync(msg.From);
+                // Per-user lock: if the same user sends 3 images simultaneously
+                // (gallery burst), queue them so they process one at a time.
+                // Users never block each other — each phone has its own semaphore.
+                var userLock = _state.UserLocks.GetOrAdd(msg.From, _ => new SemaphoreSlim(1, 1));
+                await userLock.WaitAsync();
+                try
+                {
+                    var session = await LoadSessionAsync(msg.From);
 
-                var reply = await RouteAsync(session, msg);
-                if (string.IsNullOrWhiteSpace(reply)) return;
+                    // PERF: Send an instant acknowledgement for paths that will call
+                    // an external HTTP API (HRIS verify, CRM submit, CRM lookup).
+                    var ack = GetAckMessage(session, msg);
+                    if (ack != null)
+                        await _dialog.SendTextAsync(msg.From, ack);
 
-                // Prepare Send → HTTP Request + POST Session to DB (parallel)
-                await Task.WhenAll(
-                    PersistSessionAsync(session, msg.RawText),
-                    _dialog.SendTextAsync(msg.From, reply)
-                );
+                    var reply = await RouteAsync(session, msg);
+
+                    // ALWAYS persist session — even when reply is empty (burst image
+                    // suppression). Without this, burst image IDs added to
+                    // s.ComplaintImages are never saved and disappear from the complaint.
+                    if (string.IsNullOrWhiteSpace(reply))
+                    {
+                        await PersistSessionAsync(session, msg.RawText);
+                        return;
+                    }
+
+                    // Persist session to DB and send the final reply in parallel
+                    await Task.WhenAll(
+                        PersistSessionAsync(session, msg.RawText),
+                        _dialog.SendTextAsync(msg.From, reply)
+                    );
+                }
+                finally
+                {
+                    userLock.Release();
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Bot] ProcessAsync unhandled crash");
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // INSTANT ACK
+        // Returns a short acknowledgement string for the 4 paths that hit
+        // external HTTP (HRIS verify, CRM lookup, CRM submit × 2).
+        // Returns null for all other paths — no ack needed.
+        // ─────────────────────────────────────────────────────────────────────
+
+        private static string? GetAckMessage(BotSession s, IncomingMessage msg)
+        {
+            // HRIS staff ID verification
+            if (!s.StaffVerified &&
+                s.State == "AWAITING_STAFF_ID" &&
+                msg.MsgType == "text" &&
+                !string.IsNullOrWhiteSpace(msg.RawText))
+                return s.Lang == "bn"
+                    ? "🔍 যাচাই করা হচ্ছে..."
+                    : "🔍 Verifying...";
+
+            // CRM complaint/ticket status lookup
+            if (s.State == "AWAITING_COMPLAINT_ID" && msg.MsgType == "text")
+                return s.Lang == "bn"
+                    ? "🔍 খোঁজা হচ্ছে..."
+                    : "🔍 Looking up your complaint...";
+
+            // CRM complaint submission
+            if (s.State == "AWAITING_COMPLAINT_CONFIRM" && msg.RawText == "y")
+                return s.Lang == "bn"
+                    ? "⏳ জমা দেওয়া হচ্ছে..."
+                    : "⏳ Submitting your complaint...";
+
+            // CRM agent connect request
+            if (s.State == "AWAITING_AGENT_CONFIRM" && msg.RawText == "y")
+                return s.Lang == "bn"
+                    ? "⏳ অনুরোধ পাঠানো হচ্ছে..."
+                    : "⏳ Sending your request...";
+
+            return null;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -129,12 +198,10 @@ namespace crud_app_backend.Bot.Services
             if (s.State == "INIT")
             {
                 Transition(s, "AWAITING_LANG");
-                return
-                    "🤝 *Welcome to PRAN-RFL Sales Support*\n\n" +
-                    "Please select your language:\n\n" +
-                    "1️⃣ English\n" +
-                    "2️⃣ বাংলা\n\n" +
-                    "Please reply with *1* or *2*";
+                // Send logo image + welcome text as caption.
+                // If no logo media ID is configured, SendImageAsync falls back to plain text.
+                await SendWelcomeAsync(msg.From);
+                return string.Empty; // reply already sent via SendWelcomeAsync
             }
 
             // AWAITING_LANG → language selection  (Auth Handler AWAITING_LANG block)
@@ -218,12 +285,8 @@ namespace crud_app_backend.Bot.Services
 
             // Fallback: reset to INIT
             Transition(s, "INIT");
-            return
-                "🤝 *Welcome to PRAN-RFL Sales Support*\n\n" +
-                "Please select your language:\n\n" +
-                "1️⃣ English\n" +
-                "2️⃣ বাংলা\n\n" +
-                "Please reply with *1* or *2*";
+            await SendWelcomeAsync(msg.From);
+            return string.Empty; // reply already sent via SendWelcomeAsync
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -269,6 +332,10 @@ namespace crud_app_backend.Bot.Services
 
         private async Task<string> HandleComplaintDetailAsync(BotSession s, IncomingMessage msg)
         {
+            // Track if we were already in confirm state BEFORE processing this message.
+            // Used below to suppress duplicate confirm screens on gallery burst sends.
+            var alreadyInConfirm = s.State == "AWAITING_COMPLAINT_CONFIRM";
+
             switch (msg.MsgType)
             {
                 case "text":
@@ -306,14 +373,55 @@ namespace crud_app_backend.Bot.Services
                     break;
 
                 default:
-                    // Handle Unknown — AWAITING_COMPLAINT_DETAIL branch
-                    return s.T(
-                        "❓ *Invalid input.*\n\nDescribe your problem using:\n💬 Text  |  📷 Image  |  🎙 Voice\n\nSend 0 to go back to main menu.",
-                        "❓ *অবৈধ ইনপুট।*\n\nটেক্সট, ছবি বা ভয়েস দিয়ে সমস্যা বর্ণনা করুন।\n\nমূল মেনুতে ফিরতে 0 পাঠান।");
+                    // BUG FIX: Unknown media type (document, sticker, video etc.)
+                    // Some Android WhatsApp versions send gallery images as "document".
+                    // Silently ignore — no confusing error shown. Session persisted by caller.
+                    return string.Empty;
             }
 
-            // Show Complaint Confirm
+            // Always transition to confirm state
             Transition(s, "AWAITING_COMPLAINT_CONFIRM");
+
+            // Burst vs one-by-one detection:
+            // Gallery burst  → all images have the SAME WhatsApp timestamp (sent together)
+            // One by one     → WA timestamps differ by several seconds
+            //
+            // IMPORTANT: we use msg.Timestamp (WhatsApp's own Unix timestamp, seconds)
+            // NOT DateTime.UtcNow. Using UtcNow was the bug — because images queue
+            // behind the SemaphoreSlim, Image 3 only starts processing after Images 1+2
+            // finish (each taking 1-3s for media download). By that point UtcNow-based
+            // gap exceeds 2s and Image 3 is no longer detected as a burst.
+            // WA timestamp is set by WhatsApp at send time — all gallery images share
+            // the same value regardless of how long our processing takes.
+            if (msg.MsgType == "image")
+            {
+                // Convert WA unix timestamp → DateTime. Fall back to UtcNow if missing.
+                var waTime = msg.Timestamp > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(msg.Timestamp).UtcDateTime
+                    : DateTime.UtcNow;
+
+                if (alreadyInConfirm)
+                {
+                    var isBurst = _state.LastImageTime.TryGetValue(s.Phone, out var lastTime)
+                        && Math.Abs((waTime - lastTime).TotalSeconds) <= 3;
+
+                    _state.LastImageTime[s.Phone] = waTime;
+
+                    if (isBurst)
+                    {
+                        _logger.LogDebug("[Bot] Gallery burst suppressed for {Phone}", s.Phone);
+                        return string.Empty; // image saved silently — no duplicate confirm
+                    }
+
+                    // One-by-one (gap > 3s): fall through → show confirm so user knows image received
+                }
+                else
+                {
+                    // First image in this complaint — record WA timestamp
+                    _state.LastImageTime[s.Phone] = waTime;
+                }
+            }
+
             return BuildConfirmScreen(s);
         }
 
@@ -327,8 +435,11 @@ namespace crud_app_backend.Bot.Services
             if (msg.RawText == "y") return await SubmitAsync(s, "complaint");
             if (msg.RawText == "n") return CancelComplaint(s);
 
-            // Non-Y/N → SUBMIT_COMPLAINT_INPUT — add more detail directly
-            Transition(s, "AWAITING_COMPLAINT_DETAIL");
+            // BUG FIX: do NOT transition state before calling HandleComplaintDetailAsync.
+            // If we transition first, alreadyInConfirm reads the new state (AWAITING_COMPLAINT_DETAIL)
+            // and is always false — burst detection never fires — causing 3 confirm screens
+            // for 3 gallery images. By skipping the transition here, alreadyInConfirm correctly
+            // sees AWAITING_COMPLAINT_CONFIRM and burst suppression works properly.
             return await HandleComplaintDetailAsync(s, msg);
         }
 
@@ -357,6 +468,14 @@ namespace crud_app_backend.Bot.Services
                 httpOk = resp.IsSuccessStatusCode;
                 _logger.LogInformation("[Bot] CRM {Code} body={B}",
                     (int)resp.StatusCode, respRaw.Length > 200 ? respRaw[..200] : respRaw);
+            }
+            catch (TaskCanceledException)
+            {
+                // CRM timed out (HttpClient timeout = 60s after our Program.cs change)
+                _logger.LogWarning("[Bot] CRM lookup timed out for ticketId={Id}", ticketId);
+                return s.T(
+                    "⏱ Support system is taking too long to respond.\n\nPlease try again in a moment.\n\nSend *0* to go back.",
+                    "⏱ সিস্টেম সাড়া দিতে দেরি হচ্ছে।\n\nঅনুগ্রহ করে একটু পরে আবার চেষ্টা করুন।\n\nফিরতে *0* পাঠান।");
             }
             catch (Exception ex)
             {
@@ -698,6 +817,33 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        // WELCOME MESSAGE WITH LOGO
+        // Sends the PRAN-RFL logo as an image with the welcome text as caption.
+        // Logo file lives at: wwwroot/images/pran-rfl-logo.jpg
+        // Public URL is built from App:BaseUrl in appsettings.json.
+        // Falls back to plain text automatically if image cannot be sent.
+        // ─────────────────────────────────────────────────────────────────────
+
+        private async Task SendWelcomeAsync(string phone, CancellationToken ct = default)
+        {
+            const string welcomeText =
+                "🤝 *Welcome to PRAN-RFL Sales Support*\n\n" +
+                "Please select your language:\n\n" +
+                "1️⃣ English\n" +
+                "2️⃣ বাংলা\n\n" +
+                "Please reply with *1* or *2*";
+
+            // Build the public URL for the logo from App:BaseUrl.
+            // Logo file must be placed at: wwwroot/images/pran-rfl-logo.jpg
+            // It is served as a static file by app.UseStaticFiles() in Program.cs.
+            var baseUrl = _config["App:BaseUrl"]?.TrimEnd('/') ?? "https://chatbot.prangroup.com";
+            var logoUrl = $"{baseUrl}/images/pran-rfl-logo.jpg";
+
+            // SendImageAsync falls back to plain text automatically if URL is unreachable
+            await _dialog.SendImageAsync(phone, logoUrl, welcomeText, ct);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         // HELPERS
         // ─────────────────────────────────────────────────────────────────────
 
@@ -714,7 +860,8 @@ namespace crud_app_backend.Bot.Services
             s.ComplaintImages = new();
         }
 
-        // Fix 1: load session from cache, fallback to SQL on miss
+        // PERF: load session from cache first, SQL fallback on miss.
+        // Uses sliding expiration so active users never hit SQL mid-conversation.
         private async Task<BotSession> LoadSessionAsync(string phone)
         {
             if (_cache.TryGetValue($"session:{phone}", out BotSession? cached) && cached != null)
@@ -722,20 +869,30 @@ namespace crud_app_backend.Bot.Services
                 _logger.LogDebug("[Bot] Session cache HIT {Phone}", phone);
                 return cached;
             }
+
             _logger.LogDebug("[Bot] Session cache MISS {Phone} — loading SQL", phone);
             var row = await _sessionSvc.GetSessionAsync(phone);
             var session = BotSession.Load(phone, row.TempData);
             if (session.State == "INIT" && row.CurrentStep != "INIT")
                 session.State = row.CurrentStep;
-            _cache.Set($"session:{phone}", session, TimeSpan.FromMinutes(30));
+
+            // CHANGED: sliding expiration (was fixed 30 min)
+            // Active users stay warm; idle users expire naturally after 60 min of silence
+            var opts = new MemoryCacheEntryOptions()
+                .SetSlidingExpiration(TimeSpan.FromMinutes(60));
+            _cache.Set($"session:{phone}", session, opts);
             return session;
         }
 
-        // Fix 1: update cache immediately, then write SQL
+        // PERF: update cache immediately so next message reads fresh state
+        // without a SQL round-trip, then persist to DB in background.
         private async Task PersistSessionAsync(BotSession s, string rawText)
         {
-            // Cache updated first — next message reads fresh state without SQL read
-            _cache.Set($"session:{s.Phone}", s, TimeSpan.FromMinutes(30));
+            // CHANGED: sliding expiration (was fixed 30 min)
+            var opts = new MemoryCacheEntryOptions()
+                .SetSlidingExpiration(TimeSpan.FromMinutes(60));
+            _cache.Set($"session:{s.Phone}", s, opts);
+
             try
             {
                 await _sessionSvc.UpsertSessionAsync(new UpsertSessionRequestDto
